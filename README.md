@@ -285,7 +285,7 @@ MIT License
 
 ## 🙏💖 Acknowledgements
 - 🎥 WebRTC  
-- 🔌 Socket.io  
+- 🔌 Socket.io   
 - 🎨 ShadCN UI  
 - ⚛️ Next.js  
 - 🍃 MongoDB  
