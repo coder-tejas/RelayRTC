@@ -289,6 +289,7 @@ MIT License
 - 🎨 ShadCN UI  
 - ⚛️ Next.js  
 - 🍃 MongoDB  
+<!-- Minor documentation cleanup -->
 
 ---
 
