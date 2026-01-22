@@ -35,6 +35,8 @@ export class SFUServer {
   private meetings: Map<string, MeetingRoom> = new Map();
 
   constructor(server: HTTPServer) {
+    console.log("[SFU] Booting SFU Server...");
+
     this.io = new SocketIOServer(server, {
       cors: {
         origin: process.env.FRONTEND_URL || "https://t3001.tusharsukhwal.com",
@@ -46,31 +48,39 @@ export class SFUServer {
 
     this.setupMiddleware();
     this.setupEventHandlers();
+
+    console.log("[SFU] Socket.IO initialized");
   }
 
   private setupMiddleware() {
-    // Authentication middleware
     this.io.use(async (socket: AuthenticatedSocket, next) => {
       try {
+        console.log(`[AUTH] Incoming socket: ${socket.id}`);
+
         const token = socket.handshake.auth.token;
         if (!token) {
+          console.error("[AUTH] No JWT token provided");
           return next(new Error("Authentication error"));
         }
 
         const decoded = jwt.verify(token, process.env.JWT_SECRET!) as {
           userId: string;
         };
-        const user = await User.findById(decoded.userId);
 
+        const user = await User.findById(decoded.userId);
         if (!user) {
+          console.error("[AUTH] Invalid token, user not found");
           return next(new Error("Authentication error"));
         }
 
-        socket.userId = (user._id as any).toString();
+        socket.userId = user._id.toString();
         socket.userName = user.name;
         socket.userEmail = user.email;
+
+        console.log(`[AUTH] Socket authenticated: ${socket.userId} (${user.email})`);
         next();
       } catch (error) {
+        console.error("[AUTH] JWT verification failed:", error);
         next(new Error("Authentication error"));
       }
     });
@@ -78,26 +88,24 @@ export class SFUServer {
 
   private setupEventHandlers() {
     this.io.on("connection", (socket: AuthenticatedSocket) => {
-      console.log(`User ${socket.userId} connected`);
+      console.log(`[CONNECT] User ${socket.userId} connected with socket ${socket.id}`);
 
-      // Join meeting room
-      socket.on("join-meeting", async (data: { meetingId: string }) => {
+      socket.on("join-meeting", async ({ meetingId }) => {
+        console.log(`[ROOM] ${socket.userId} attempting to join ${meetingId}`);
+
         try {
-          const { meetingId } = data;
-
-          // Verify meeting exists and user can join
           const meeting = await Meeting.findOne({ meetingId, isActive: true });
           if (!meeting) {
+            console.error(`[ROOM] Meeting not found: ${meetingId}`);
             socket.emit("error", { message: "Meeting not found or ended" });
             return;
           }
 
-          // Join socket to room
           socket.join(meetingId);
           socket.meetingId = meetingId;
 
-          // Initialize or get meeting room
           if (!this.meetings.has(meetingId)) {
+            console.log(`[ROOM] Creating new room: ${meetingId}`);
             this.meetings.set(meetingId, {
               meetingId,
               participants: new Map(),
@@ -107,7 +115,6 @@ export class SFUServer {
 
           const room = this.meetings.get(meetingId)!;
 
-          // Add participant to room
           room.participants.set(socket.id, {
             socketId: socket.id,
             userId: socket.userId!,
@@ -116,186 +123,82 @@ export class SFUServer {
             bandwidth: { up: 0, down: 0 },
           });
 
-          // Notify existing participants about new user
+          console.log(`[ROOM] ${socket.userId} joined ${meetingId}. Total: ${room.participants.size}`);
+
           socket.to(meetingId).emit("user-joined", {
             userId: socket.userId,
             socketId: socket.id,
-            name: socket.userName || "Unknown User",
-            email: socket.userEmail || "",
+            name: socket.userName,
+            email: socket.userEmail,
           });
 
-          // Send existing participants to new user with user info
           const existingParticipants = await Promise.all(
             Array.from(room.participants.values())
-              .filter((p) => p.socketId !== socket.id)
-              .map(async (p) => {
-                const userInfo = p.userId
-                  ? await this.getUserInfo(p.userId)
-                  : null;
-                return {
-                  ...p,
-                  name: userInfo?.name || "Unknown User",
-                  email: userInfo?.email || "",
-                };
+              .filter(p => p.socketId !== socket.id)
+              .map(async p => {
+                const userInfo = await this.getUserInfo(p.userId);
+                return { ...p, name: userInfo?.name, email: userInfo?.email };
               })
           );
 
           socket.emit("existing-participants", existingParticipants);
-
-          // Send room info
           socket.emit("room-info", {
             meetingId,
             participants: Array.from(room.participants.values()),
             isHost: room.host === socket.userId,
           });
-        } catch (error) {
+        } catch (err) {
+          console.error("[ROOM] Join failed:", err);
           socket.emit("error", { message: "Failed to join meeting" });
         }
       });
 
-      // Handle WebRTC signaling
-      socket.on(
-        "offer",
-        (data: { to: string; offer: RTCSessionDescriptionInit }) => {
-          socket.to(data.to).emit("offer", {
-            from: socket.id,
-            offer: data.offer,
-          });
-        }
-      );
+      socket.on("offer", d => {
+        console.log(`[RTC] Offer from ${socket.id} to ${d.to}`);
+        socket.to(d.to).emit("offer", { from: socket.id, offer: d.offer });
+      });
 
-      socket.on(
-        "answer",
-        (data: { to: string; answer: RTCSessionDescriptionInit }) => {
-          socket.to(data.to).emit("answer", {
-            from: socket.id,
-            answer: data.answer,
-          });
-        }
-      );
+      socket.on("answer", d => {
+        console.log(`[RTC] Answer from ${socket.id} to ${d.to}`);
+        socket.to(d.to).emit("answer", { from: socket.id, answer: d.answer });
+      });
 
-      socket.on(
-        "ice-candidate",
-        (data: { to: string; candidate: RTCIceCandidateInit }) => {
-          socket.to(data.to).emit("ice-candidate", {
-            from: socket.id,
-            candidate: data.candidate,
-          });
-        }
-      );
+      socket.on("ice-candidate", d => {
+        console.log(`[RTC] ICE from ${socket.id} to ${d.to}`);
+        socket.to(d.to).emit("ice-candidate", { from: socket.id, candidate: d.candidate });
+      });
 
-      // Handle media control
-      socket.on("toggle-audio", (data: { enabled: boolean }) => {
-        if (socket.meetingId) {
-          socket.to(socket.meetingId).emit("user-audio-toggled", {
-            userId: socket.userId,
-            socketId: socket.id,
-            enabled: data.enabled,
-          });
+      socket.on("toggle-audio", d => {
+        console.log(`[MEDIA] Audio ${d.enabled ? "ON" : "OFF"} by ${socket.userId}`);
+        socket.to(socket.meetingId!).emit("user-audio-toggled", { socketId: socket.id, enabled: d.enabled });
+      });
+
+      socket.on("toggle-video", d => {
+        console.log(`[MEDIA] Video ${d.enabled ? "ON" : "OFF"} by ${socket.userId}`);
+        socket.to(socket.meetingId!).emit("user-video-toggled", { socketId: socket.id, enabled: d.enabled });
+      });
+
+      socket.on("stats-update", d => {
+        const room = this.meetings.get(socket.meetingId!);
+        if (room?.participants.has(socket.id)) {
+          room.participants.get(socket.id)!.latency = d.latency;
+          room.participants.get(socket.id)!.bandwidth = d.bandwidth;
+          console.log(`[STATS] ${socket.userId} latency=${d.latency}ms up=${d.bandwidth.up}kbps down=${d.bandwidth.down}kbps`);
         }
       });
 
-      socket.on("toggle-video", (data: { enabled: boolean }) => {
-        if (socket.meetingId) {
-          socket.to(socket.meetingId).emit("user-video-toggled", {
-            userId: socket.userId,
-            socketId: socket.id,
-            enabled: data.enabled,
-          });
-        }
-      });
-
-      // Handle connection stats updates
-      socket.on(
-        "stats-update",
-        (data: {
-          latency: number;
-          bandwidth: { up: number; down: number };
-        }) => {
-          if (socket.meetingId) {
-            const room = this.meetings.get(socket.meetingId);
-            if (room && room.participants.has(socket.id)) {
-              const participant = room.participants.get(socket.id)!;
-              participant.latency = data.latency;
-              participant.bandwidth = data.bandwidth;
-            }
-          }
-        }
-      );
-
-      // Get connection stats
-      socket.on("get-stats", () => {
-        if (socket.meetingId) {
-          const room = this.meetings.get(socket.meetingId);
-          if (room) {
-            const stats = Array.from(room.participants.values());
-            socket.emit("connection-stats", stats);
-          }
-        }
-      });
-
-      // Handle disconnection
       socket.on("disconnect", () => {
-        console.log(`User ${socket.userId} disconnected`);
+        console.log(`[DISCONNECT] ${socket.userId} (${socket.id})`);
 
-        if (socket.meetingId) {
-          const room = this.meetings.get(socket.meetingId);
-          if (room) {
-            room.participants.delete(socket.id);
+        const room = this.meetings.get(socket.meetingId!);
+        if (room) {
+          room.participants.delete(socket.id);
+          socket.to(socket.meetingId!).emit("user-left", { socketId: socket.id });
 
-            // Notify other participants
-            socket.to(socket.meetingId).emit("user-left", {
-              userId: socket.userId,
-              socketId: socket.id,
-            });
-
-            // Clean up empty rooms
-            if (room.participants.size === 0) {
-              this.meetings.delete(socket.meetingId);
-            }
+          if (room.participants.size === 0) {
+            console.log(`[ROOM] Destroying empty room ${socket.meetingId}`);
+            this.meetings.delete(socket.meetingId!);
           }
-        }
-      });
-
-      // Handle leaving meeting
-      socket.on("leave-meeting", () => {
-        if (socket.meetingId) {
-          const room = this.meetings.get(socket.meetingId);
-          if (room) {
-            room.participants.delete(socket.id);
-
-            socket.to(socket.meetingId).emit("user-left", {
-              userId: socket.userId,
-              socketId: socket.id,
-            });
-
-            socket.leave(socket.meetingId);
-            socket.meetingId = undefined;
-
-            // Clean up empty rooms
-            if (room.participants.size === 0) {
-              this.meetings.delete(socket.meetingId);
-            }
-          }
-        }
-      });
-
-      // Handle screen sharing
-      socket.on("start-screen-share", () => {
-        if (socket.meetingId) {
-          socket.to(socket.meetingId).emit("user-started-screen-share", {
-            userId: socket.userId,
-            socketId: socket.id,
-          });
-        }
-      });
-
-      socket.on("stop-screen-share", () => {
-        if (socket.meetingId) {
-          socket.to(socket.meetingId).emit("user-stopped-screen-share", {
-            userId: socket.userId,
-            socketId: socket.id,
-          });
         }
       });
     });
@@ -305,6 +208,7 @@ export class SFUServer {
     const room = this.meetings.get(meetingId);
     if (!room) return null;
 
+    console.log(`[STATS] Fetching room stats for ${meetingId}`);
     return {
       meetingId,
       participantCount: room.participants.size,
@@ -312,15 +216,12 @@ export class SFUServer {
     };
   }
 
-  // Helper method to get user info from database
   private async getUserInfo(userId: string) {
     try {
-      console.log(`🔍 Fetching user info for userId: ${userId}`);
-      const user = await User.findById(userId).select("name email");
-      console.log(`✅ Found user:`, user);
-      return user;
+      console.log(`[DB] Fetching user ${userId}`);
+      return await User.findById(userId).select("name email");
     } catch (error) {
-      console.error("❌ Error fetching user info:", error);
+      console.error("[DB] User lookup failed:", error);
       return null;
     }
   }

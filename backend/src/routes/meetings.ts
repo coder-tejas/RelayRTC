@@ -6,20 +6,25 @@ import { authenticateToken, AuthRequest } from "../middleware/auth";
 
 const router = express.Router();
 
-// Create new meeting
+/* ===================== CREATE MEETING ===================== */
 router.post(
   "/create",
   authenticateToken,
   [body("title").trim().isLength({ min: 1 })],
   async (req: AuthRequest, res) => {
+    console.log(`[MEETING] Create request by user ${req.user?._id}`);
+
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
+        console.warn("[MEETING] Validation failed:", errors.array());
         return res.status(400).json({ errors: errors.array() });
       }
 
       const { title } = req.body;
-      const meetingId = uuidv4().substring(0, 8); // Short meeting ID
+      const meetingId = uuidv4().substring(0, 8);
+
+      console.log(`[MEETING] Creating meeting "${title}" with id ${meetingId}`);
 
       const meeting = new Meeting({
         title,
@@ -30,6 +35,8 @@ router.post(
 
       await meeting.save();
       await meeting.populate("hostId", "name email");
+
+      console.log(`[MEETING] Created ${meetingId} by ${req.user!._id}`);
 
       res.status(201).json({
         message: "Meeting created successfully",
@@ -44,35 +51,40 @@ router.post(
         },
       });
     } catch (error) {
+      console.error("[MEETING] Create failed:", error);
       res.status(500).json({ message: "Server error", error });
     }
   }
 );
 
-// Join meeting
+/* ===================== JOIN MEETING ===================== */
 router.post(
   "/join/:meetingId",
   authenticateToken,
   async (req: AuthRequest, res) => {
-    try {
-      const { meetingId } = req.params;
+    const { meetingId } = req.params;
+    console.log(`[MEETING] User ${req.user?._id} joining ${meetingId}`);
 
+    try {
       const meeting = await Meeting.findOne({ meetingId, isActive: true })
         .populate("hostId", "name email")
         .populate("participants", "name email");
 
       if (!meeting) {
+        console.warn(`[MEETING] Join failed. Not found: ${meetingId}`);
         return res.status(404).json({ message: "Meeting not found or ended" });
       }
 
-      // Add user to participants if not already added
-      if (
-        !meeting.participants.some(
-          (p) => p._id.toString() === req.user!._id.toString()
-        )
-      ) {
+      const alreadyJoined = meeting.participants.some(
+        (p) => p._id.toString() === req.user!._id.toString()
+      );
+
+      if (!alreadyJoined) {
         meeting.participants.push(req.user!._id as any);
         await meeting.save();
+        console.log(`[MEETING] User ${req.user!._id} added to ${meetingId}`);
+      } else {
+        console.log(`[MEETING] User ${req.user!._id} already in ${meetingId}`);
       }
 
       res.json({
@@ -88,21 +100,24 @@ router.post(
         },
       });
     } catch (error) {
+      console.error(`[MEETING] Join failed for ${meetingId}:`, error);
       res.status(500).json({ message: "Server error", error });
     }
   }
 );
 
-// Get meeting details
+/* ===================== GET MEETING ===================== */
 router.get("/:meetingId", authenticateToken, async (req: AuthRequest, res) => {
-  try {
-    const { meetingId } = req.params;
+  const { meetingId } = req.params;
+  console.log(`[MEETING] Fetch details for ${meetingId}`);
 
+  try {
     const meeting = await Meeting.findOne({ meetingId })
       .populate("hostId", "name email")
       .populate("participants", "name email");
 
     if (!meeting) {
+      console.warn(`[MEETING] Not found: ${meetingId}`);
       return res.status(404).json({ message: "Meeting not found" });
     }
 
@@ -119,47 +134,53 @@ router.get("/:meetingId", authenticateToken, async (req: AuthRequest, res) => {
       },
     });
   } catch (error) {
+    console.error(`[MEETING] Fetch failed for ${meetingId}:`, error);
     res.status(500).json({ message: "Server error", error });
   }
 });
 
-// End meeting (only host can end)
+/* ===================== END MEETING ===================== */
 router.post(
   "/end/:meetingId",
   authenticateToken,
   async (req: AuthRequest, res) => {
-    try {
-      const { meetingId } = req.params;
+    const { meetingId } = req.params;
+    console.log(`[MEETING] End request for ${meetingId} by ${req.user?._id}`);
 
+    try {
       const meeting = await Meeting.findOne({ meetingId });
 
       if (!meeting) {
+        console.warn(`[MEETING] End failed. Not found: ${meetingId}`);
         return res.status(404).json({ message: "Meeting not found" });
       }
 
-      // Check if user is the host
       if (meeting.hostId.toString() !== req.user!._id.toString()) {
-        return res
-          .status(403)
-          .json({ message: "Only host can end the meeting" });
+        console.warn(`[MEETING] Unauthorized end attempt by ${req.user!._id}`);
+        return res.status(403).json({ message: "Only host can end the meeting" });
       }
 
       meeting.isActive = false;
       meeting.endedAt = new Date();
       await meeting.save();
 
+      console.log(`[MEETING] ${meetingId} ended by host ${req.user!._id}`);
+
       res.json({ message: "Meeting ended successfully" });
     } catch (error) {
+      console.error(`[MEETING] End failed for ${meetingId}:`, error);
       res.status(500).json({ message: "Server error", error });
     }
   }
 );
 
-// Get user's meetings
+/* ===================== USER MEETINGS ===================== */
 router.get(
   "/user/meetings",
   authenticateToken,
   async (req: AuthRequest, res) => {
+    console.log(`[MEETING] Fetch meetings for user ${req.user?._id}`);
+
     try {
       const meetings = await Meeting.find({
         $or: [{ hostId: req.user!._id }, { participants: req.user!._id }],
@@ -168,7 +189,8 @@ router.get(
         .populate("participants", "name email")
         .sort({ createdAt: -1 });
 
-      // Transform meetings to include id field
+      console.log(`[MEETING] Found ${meetings.length} meetings for ${req.user?._id}`);
+
       const transformedMeetings = meetings.map((meeting) => ({
         id: meeting._id,
         title: meeting.title,
@@ -182,6 +204,7 @@ router.get(
 
       res.json({ meetings: transformedMeetings });
     } catch (error) {
+      console.error("[MEETING] User meetings fetch failed:", error);
       res.status(500).json({ message: "Server error", error });
     }
   }

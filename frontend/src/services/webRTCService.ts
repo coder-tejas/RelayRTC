@@ -36,7 +36,7 @@ class WebRTCService {
   // Initialize socket connection
   async connect(token: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.socket = io("https://t3000.tusharsukhwal.com", {
+      this.socket = io("http://localhost:3001", {
         auth: { token },
         transports: ["websocket", "polling"],
       });
